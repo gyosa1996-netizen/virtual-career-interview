@@ -1,6 +1,3 @@
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.95.0/+esm";
-import { SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "./config.js";
-
 const JOBS = [
   { name: "의사", icon: "🩺", desc: "환자를 진료하고 치료합니다." },
   { name: "간호사", icon: "💉", desc: "환자의 회복과 치료를 돕습니다." },
@@ -37,6 +34,10 @@ const SUGGESTED_QUESTIONS = [
   "이 직업을 꿈꾸는 학생에게 조언해 주세요.",
 ];
 
+const FUNCTION_URL = "/api/career-interview";
+const SOFT_LIMIT_COUNT = 40;
+const SOFT_LIMIT_WINDOW_MS = 60 * 60 * 1000;
+
 const els = {
   setupView: document.querySelector("#setupView"),
   chatView: document.querySelector("#chatView"),
@@ -59,7 +60,6 @@ const els = {
   toast: document.querySelector("#toast"),
 };
 
-let supabase = null;
 let selectedJob = null;
 let messages = [];
 let sending = false;
@@ -105,7 +105,7 @@ function renderQuestions() {
 }
 
 function startInterview(jobName, restoredMessages = null) {
-  selectedJob = jobName.trim();
+  selectedJob = String(jobName || "").trim().slice(0, 40);
   if (!selectedJob) return;
 
   messages = restoredMessages?.length
@@ -144,22 +144,23 @@ function renderMessages() {
   els.messages.scrollTop = els.messages.scrollHeight;
 }
 
-async function ensureAnonymousSession() {
-  if (!supabase) {
-    if (SUPABASE_URL.includes("YOUR_PROJECT_REF") || SUPABASE_PUBLISHABLE_KEY.includes("YOUR_SUPABASE")) {
-      throw new Error("config.js에 Supabase URL과 Publishable key를 입력해 주세요.");
-    }
-    supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
-    });
+function checkAndRecordLocalUsage() {
+  const key = "careerInterviewUsage";
+  const now = Date.now();
+  let timestamps = [];
+
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    if (Array.isArray(saved)) timestamps = saved.filter((t) => Number.isFinite(t));
+  } catch (_) {}
+
+  timestamps = timestamps.filter((t) => now - t < SOFT_LIMIT_WINDOW_MS);
+  if (timestamps.length >= SOFT_LIMIT_COUNT) {
+    throw new Error("이 기기에서 1시간 동안 사용할 수 있는 질문 수(40회)를 초과했습니다.");
   }
 
-  const { data: sessionData } = await supabase.auth.getSession();
-  if (sessionData.session) return sessionData.session;
-
-  const { data, error } = await supabase.auth.signInAnonymously();
-  if (error) throw new Error(`익명 접속 실패: ${error.message}`);
-  return data.session;
+  timestamps.push(now);
+  localStorage.setItem(key, JSON.stringify(timestamps));
 }
 
 async function sendMessage(text) {
@@ -172,16 +173,22 @@ async function sendMessage(text) {
   saveSession();
 
   try {
-    await ensureAnonymousSession();
+    checkAndRecordLocalUsage();
 
     const context = messages.slice(-14).map(({ role, content }) => ({ role, content }));
-    const { data, error } = await supabase.functions.invoke("career-interview", {
-      body: { job: selectedJob, messages: context },
+    const response = await fetch(FUNCTION_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job: selectedJob, messages: context }),
     });
 
-    if (error) {
-      const details = await extractFunctionError(error);
-      throw new Error(details || error.message || "AI 호출에 실패했습니다.");
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (_) {}
+
+    if (!response.ok) {
+      throw new Error(data?.error || `서버 오류가 발생했습니다. (${response.status})`);
     }
     if (!data?.reply) throw new Error("AI 응답 내용이 비어 있습니다.");
 
@@ -199,16 +206,6 @@ async function sendMessage(text) {
     sending = false;
     setBusy(false, "");
   }
-}
-
-async function extractFunctionError(error) {
-  try {
-    if (error?.context && typeof error.context.json === "function") {
-      const body = await error.context.json();
-      return body?.error || body?.message || "";
-    }
-  } catch (_) {}
-  return "";
 }
 
 function setBusy(isBusy, text) {
